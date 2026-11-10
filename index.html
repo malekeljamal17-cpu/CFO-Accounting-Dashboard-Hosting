@@ -877,7 +877,8 @@ const SB_TABLES = [ {
   table: "bank_statement_lines"
 }, {
   key: "integrityCheckpoints",
-  table: "integrity_checkpoints"
+  table: "integrity_checkpoints",
+  orderBy: "at"
 }, {
   key: "insurancePolicies",
   table: "insurance_policies"
@@ -925,7 +926,7 @@ function recordToSnake(rec) {
 }
 
 async function loadStateFromSupabase() {
-  const results = await Promise.all(SB_TABLES.map(cfg => cfg.singleton ? sb.from(cfg.table).select("*").eq("id", 1).single() : sb.from(cfg.table).select("*").order("created_at", {
+  const results = await Promise.all(SB_TABLES.map(cfg => cfg.singleton ? sb.from(cfg.table).select("*").eq("id", 1).single() : sb.from(cfg.table).select("*").order(cfg.orderBy || "created_at", {
     ascending: true
   })));
   const activityLogResult = await sb.from("activity_log").select("*").order("at", {
