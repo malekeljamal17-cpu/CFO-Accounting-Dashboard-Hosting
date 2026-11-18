@@ -506,6 +506,8 @@ const SEED_INSURANCE_PREMIUMS = [];
 
 const SEED_INHERITANCE_CASES = [];
 
+const SEED_FIXED_ASSETS = [];
+
 const INHERITANCE_STAGES = [ {
   stage: 1,
   title: "Papers from the Mukhtar",
@@ -808,6 +810,7 @@ function migrateLegacyState(parsed) {
   if (!parsed.insurancePolicies) parsed.insurancePolicies = [ ...SEED_INSURANCE_POLICIES ];
   if (!parsed.insurancePremiums) parsed.insurancePremiums = [ ...SEED_INSURANCE_PREMIUMS ];
   if (!parsed.inheritanceCases) parsed.inheritanceCases = [ ...SEED_INHERITANCE_CASES ];
+  if (!parsed.fixedAssets) parsed.fixedAssets = [ ...SEED_FIXED_ASSETS ];
   return parsed;
 }
 
@@ -836,7 +839,8 @@ let state = {
   integrityCheckpoints: [ ...SEED_INTEGRITY_CHECKPOINTS ],
   insurancePolicies: [ ...SEED_INSURANCE_POLICIES ],
   insurancePremiums: [ ...SEED_INSURANCE_PREMIUMS ],
-  inheritanceCases: [ ...SEED_INHERITANCE_CASES ]
+  inheritanceCases: [ ...SEED_INHERITANCE_CASES ],
+  fixedAssets: [ ...SEED_FIXED_ASSETS ]
 };
 
 const SUPABASE_URL = "https://gheoxhqbgzhkiwthtzff.supabase.co";
@@ -895,6 +899,9 @@ const SB_TABLES = [ {
 }, {
   key: "inheritanceCases",
   table: "inheritance_cases"
+}, {
+  key: "fixedAssets",
+  table: "fixed_assets"
 }, {
   key: "settings",
   table: "settings",
@@ -1391,6 +1398,8 @@ let expandedInsuranceHistory = null;
 
 let expandedInheritanceCase = null;
 
+let expandedFixedAssetHistory = null;
+
 async function compareIntegrityCheckpoint(pasted) {
   const normalized = String(pasted || "").replace(/[^0-9a-fA-F]/g, "").toLowerCase();
   if (normalized.length !== 64) {
@@ -1544,6 +1553,13 @@ function computeGlobalSearchResults(query) {
     type: "Inheritance",
     label: k.deceasedName,
     tab: "inheritance",
+    searchKey: null,
+    value: null
+  });
+  for (const a of state.fixedAssets) if (matchesSearch(query, a.name, a.category, a.number)) results.push({
+    type: "Fixed Asset",
+    label: a.name,
+    tab: "fixed-assets",
     searchKey: null,
     value: null
   });
@@ -2553,6 +2569,209 @@ function computeInheritanceCases() {
   });
 }
 
+function monthsBetween(fromISO, toISO) {
+  const from = new Date(fromISO), to = new Date(toISO);
+  if (to <= from) return 0;
+  let months = (to.getUTCFullYear() - from.getUTCFullYear()) * 12 + (to.getUTCMonth() - from.getUTCMonth());
+  if (to.getUTCDate() < from.getUTCDate()) months--;
+  return Math.max(0, months);
+}
+
+function computeFixedAssets() {
+  const today = todayISO();
+  return state.fixedAssets.map(asset => {
+    const depreciationExpenses = state.expenses.filter(e => e.fixedAssetId === asset.id);
+    const accumulatedDepreciation = depreciationExpenses.reduce((s, e) => s + e.amount, 0);
+    const lastDepreciationDate = depreciationExpenses.length ? depreciationExpenses.reduce((max, e) => e.date > max ? e.date : max, depreciationExpenses[0].date) : null;
+    const depreciableBase = Math.max(0, asset.cost - (asset.salvageValue || 0));
+    const monthlyDepreciation = asset.usefulLifeMonths > 0 ? depreciableBase / asset.usefulLifeMonths : 0;
+    const nbv = Math.max(asset.salvageValue || 0, asset.cost - accumulatedDepreciation);
+    const fullyDepreciated = accumulatedDepreciation >= depreciableBase - .01;
+    let pendingMonths = 0, pendingAmount = 0;
+    if (!asset.disposed && !fullyDepreciated) {
+      const since = lastDepreciationDate || asset.acquisitionDate;
+      pendingMonths = monthsBetween(since, today);
+      pendingAmount = Math.min(monthlyDepreciation * pendingMonths, depreciableBase - accumulatedDepreciation);
+    }
+    return Object.assign({}, asset, {
+      accumulatedDepreciation: accumulatedDepreciation,
+      lastDepreciationDate: lastDepreciationDate,
+      monthlyDepreciation: monthlyDepreciation,
+      nbv: nbv,
+      fullyDepreciated: fullyDepreciated,
+      pendingMonths: pendingMonths,
+      pendingAmount: pendingAmount,
+      depreciableBase: depreciableBase
+    });
+  });
+}
+
+async function addFixedAsset(data, editId) {
+  if (!data.name) {
+    toast("Asset name is required.", true);
+    return;
+  }
+  if (!isPositiveNumber(data.cost)) {
+    toast("Cost must be a positive number.", true);
+    return;
+  }
+  if (!data.acquisitionDate) {
+    toast("Acquisition date is required.", true);
+    return;
+  }
+  const usefulLifeMonths = Number(data.usefulLifeMonths);
+  if (!Number.isInteger(usefulLifeMonths) || usefulLifeMonths <= 0) {
+    toast("Useful life must be a whole number of months, greater than zero.", true);
+    return;
+  }
+  const cost = Number(data.cost);
+  const salvageValue = Number(data.salvageValue) || 0;
+  if (salvageValue < 0 || salvageValue >= cost) {
+    toast("Salvage value must be zero or more, and less than the cost.", true);
+    return;
+  }
+  if (editId) {
+    const a = state.fixedAssets.find(a => a.id === editId);
+    Object.assign(a, data, {
+      cost: cost,
+      salvageValue: salvageValue,
+      usefulLifeMonths: usefulLifeMonths
+    });
+    logActivity(`Fixed asset "${a.name}" updated`);
+    await saveState();
+    closeModal();
+    render();
+    toast("Asset updated");
+    return;
+  }
+  const number = nextReferenceNumber("FA", state.fixedAssets, "number");
+  state.fixedAssets.push(Object.assign({
+    id: uid(),
+    number: number,
+    method: "straight_line",
+    disposed: false,
+    disposalDate: null,
+    disposalProceeds: null
+  }, data, {
+    cost: cost,
+    salvageValue: salvageValue,
+    usefulLifeMonths: usefulLifeMonths
+  }));
+  logActivity(`Fixed asset "${data.name}" added (${fmt(cost, data.currency)}, ${usefulLifeMonths}-month useful life)`);
+  await saveState();
+  closeModal();
+  render();
+  toast("Asset added");
+}
+
+async function deleteFixedAsset(id) {
+  const a = state.fixedAssets.find(a => a.id === id);
+  if (!a) return;
+  const linked = state.expenses.filter(e => e.fixedAssetId === id);
+  if (!confirm(`Delete asset "${a.name}"${linked.length ? ` and its ${linked.length} posted depreciation entry(ies)` : ""}? This cannot be undone.`)) return;
+  for (const e of linked) {
+    await removeJournalEntry("expense", e.id);
+    await supabaseDelete("expenses", e.id);
+  }
+  state.expenses = state.expenses.filter(e => e.fixedAssetId !== id);
+  state.fixedAssets = state.fixedAssets.filter(a => a.id !== id);
+  await supabaseDelete("fixed_assets", id);
+  logActivity(`Fixed asset "${a.name}" deleted${linked.length ? ` (removing ${linked.length} depreciation entry(ies) and their ledger postings)` : ""}`);
+  await saveState();
+  render();
+  toast("Asset deleted");
+}
+
+async function disposeFixedAsset(id, disposalDate, disposalProceeds) {
+  const a = state.fixedAssets.find(a => a.id === id);
+  if (!a) return;
+  if (!disposalDate) {
+    toast("Disposal date is required.", true);
+    return;
+  }
+  a.disposed = true;
+  a.disposalDate = disposalDate;
+  a.disposalProceeds = disposalProceeds ? Number(disposalProceeds) : null;
+  logActivity(`Fixed asset "${a.name}" marked disposed as of ${disposalDate}${a.disposalProceeds ? ` (proceeds ${fmt(a.disposalProceeds, a.currency)})` : ""} — recording only, no disposal gain/loss posted to the ledger`);
+  await saveState();
+  closeModal();
+  render();
+  toast("Asset marked disposed");
+}
+
+async function undisposeFixedAsset(id) {
+  const a = state.fixedAssets.find(a => a.id === id);
+  if (!a) return;
+  a.disposed = false;
+  a.disposalDate = null;
+  a.disposalProceeds = null;
+  logActivity(`Fixed asset "${a.name}" un-disposed`);
+  await saveState();
+  render();
+  toast("Disposal reverted");
+}
+
+async function runDepreciation(asOfDate) {
+  if (!asOfDate) {
+    toast('Pick an "as of" date.', true);
+    return;
+  }
+  if (asOfDate > todayISO()) {
+    toast('"As of" date cannot be in the future.', true);
+    return;
+  }
+  const assets = computeFixedAssets().filter(a => !a.disposed && !a.fullyDepreciated);
+  let postedCount = 0, totalUSD = 0;
+  for (const asset of assets) {
+    const since = asset.lastDepreciationDate || asset.acquisitionDate;
+    const months = monthsBetween(since, asOfDate);
+    if (months <= 0) continue;
+    const amount = Math.min(asset.monthlyDepreciation * months, asset.depreciableBase - asset.accumulatedDepreciation);
+    if (amount <= .01) continue;
+    const expenseId = uid();
+    const number = nextReferenceNumber("EXP", state.expenses, "number");
+    state.expenses.push({
+      id: expenseId,
+      number: number,
+      date: asOfDate,
+      category: "Depreciation",
+      description: `Depreciation — ${asset.name} (${asset.number}), ${months} month(s)`,
+      vendor: "",
+      amount: amount,
+      currency: asset.currency,
+      vatRate: 0,
+      vatAmount: 0,
+      notes: "Fixed Asset Register — system-calculated, straight-line",
+      attachment: null,
+      consentConfirmed: true,
+      consentConfirmedBy: "System (Depreciation — non-cash, no joint consent required)",
+      createdBy: actingAsName(),
+      fixedAssetId: asset.id
+    });
+    const amountUSD = usdEquivalent(amount, asset.currency);
+    postJournalEntry(asOfDate, `Depreciation — ${asset.name} (${asset.number})`, [ {
+      account: "expense",
+      debit: amountUSD,
+      credit: 0
+    }, {
+      account: "accumulated_depreciation",
+      debit: 0,
+      credit: amountUSD
+    } ], "expense", expenseId);
+    postedCount++;
+    totalUSD += amountUSD;
+  }
+  if (!postedCount) {
+    toast("Nothing to post — every asset is already depreciated through this date (or fully depreciated).");
+    return;
+  }
+  logActivity(`Depreciation run through ${asOfDate}: ${fmt(totalUSD, "USD")} posted across ${postedCount} asset(s)`);
+  await saveState();
+  closeModal();
+  render();
+  toast(`Depreciation posted for ${postedCount} asset(s)`);
+}
+
 async function updateQarRate(newRate) {
   if (!Number.isFinite(newRate) || newRate <= 0) {
     toast("QAR/USD peg must be a positive number.", true);
@@ -3192,6 +3411,7 @@ function switchTab(tab) {
   checkpointCompareResult = null;
   expandedInsuranceHistory = null;
   expandedInheritanceCase = null;
+  expandedFixedAssetHistory = null;
   render();
 }
 
@@ -3206,13 +3426,14 @@ function render() {
   const selEnd = activeId && "selectionEnd" in active ? active.selectionEnd : null;
   const insuranceAlertCount = computeInsurancePolicies().filter(p => p.alertLevel === "due_soon" || p.alertLevel === "overdue").length;
   const inheritanceAlertCount = computeInheritanceCases().filter(k => k.deadlineAlertLevel === "due_soon" || k.deadlineAlertLevel === "overdue").length;
+  const fixedAssetPendingCount = computeFixedAssets().filter(a => !a.disposed && a.pendingAmount > .01).length;
   const app = document.getElementById("app");
-  app.innerHTML = `\n    <aside class="sidebar">\n      <div class="sidebar-brand">\n        <div class="brand-mark">CFO</div>\n        <div class="brand-text"><strong>Camel Family Office</strong><span>Accounting Dashboard</span></div>\n        <button class="mobile-nav-toggle" onclick="toggleMobileNav()" aria-label="Menu">${mobileNavOpen ? "✕" : "☰"}</button>\n      </div>\n      ${renderActingAs()}\n      ${renderGlobalSearch()}\n      <div class="sidebar-collapsible${mobileNavOpen ? " open" : ""}">\n        <nav class="nav">\n          ${[ [ "overview", "Overview" ], [ "clients", "Clients" ], [ "invoices", "Invoices" ], [ "payments", "Payments" ], [ "expenses", "Expenses" ], [ "zakat", "Zakat Ledger" ], [ "balance-sheet", "Balance Sheet" ], [ "general-ledger", "General Ledger" ], [ "reconciliation", "Bank Reconciliation" ], [ "vendors", "Vendors" ], [ "insurance", "Insurance" ], [ "inheritance", "Inheritance" ], [ "reports", "Reports" ], [ "activity-log", "Activity Log" ], [ "settings", "Settings" ] ].map(([key, label]) => {
-    const count = key === "insurance" ? insuranceAlertCount : key === "inheritance" ? inheritanceAlertCount : 0;
+  app.innerHTML = `\n    <aside class="sidebar">\n      <div class="sidebar-brand">\n        <div class="brand-mark">CFO</div>\n        <div class="brand-text"><strong>Camel Family Office</strong><span>Accounting Dashboard</span></div>\n        <button class="mobile-nav-toggle" onclick="toggleMobileNav()" aria-label="Menu">${mobileNavOpen ? "✕" : "☰"}</button>\n      </div>\n      ${renderActingAs()}\n      ${renderGlobalSearch()}\n      <div class="sidebar-collapsible${mobileNavOpen ? " open" : ""}">\n        <nav class="nav">\n          ${[ [ "overview", "Overview" ], [ "clients", "Clients" ], [ "invoices", "Invoices" ], [ "payments", "Payments" ], [ "expenses", "Expenses" ], [ "zakat", "Zakat Ledger" ], [ "balance-sheet", "Balance Sheet" ], [ "fixed-assets", "Fixed Assets" ], [ "general-ledger", "General Ledger" ], [ "reconciliation", "Bank Reconciliation" ], [ "vendors", "Vendors" ], [ "insurance", "Insurance" ], [ "inheritance", "Inheritance" ], [ "reports", "Reports" ], [ "activity-log", "Activity Log" ], [ "settings", "Settings" ] ].map(([key, label]) => {
+    const count = key === "insurance" ? insuranceAlertCount : key === "inheritance" ? inheritanceAlertCount : key === "fixed-assets" ? fixedAssetPendingCount : 0;
     return `<button class="nav-item${currentTab === key ? " active" : ""}" onclick="switchTab('${key}')">${label}${count ? ` <span style="background:#B23B3B;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px;margin-left:4px;">${count}</span>` : ""}</button>`;
   }).join("")}\n        </nav>\n        <div class="sidebar-footer" style="display:flex; flex-direction:column; gap:8px;">\n          ${!SUPABASE_ENABLED ? `${encryptionPassphrase ? `<button onclick="lockNow()">🔒 Lock Now</button>` : ""}\n          <button onclick="openEncryptionModal()">🔐 Encryption Settings</button>` : ""}\n          <button onclick="exportJSON()">⭳ Export data</button>\n          ${!SUPABASE_ENABLED ? `<button onclick="document.getElementById('import-file-input').click()">⭱ Import backup</button>\n          <input type="file" id="import-file-input" accept="application/json" class="hidden" onchange="handleImportFile(event)" />` : ""}\n        </div>\n      </div>\n    </aside>\n    <main class="main" id="mainContent"></main>\n  `;
   const main = document.getElementById("mainContent");
-  if (currentTab === "overview") main.innerHTML = renderOverview(); else if (currentTab === "clients") main.innerHTML = renderClients(); else if (currentTab === "invoices") main.innerHTML = renderInvoices(); else if (currentTab === "payments") main.innerHTML = renderPayments(); else if (currentTab === "expenses") main.innerHTML = renderExpenses(); else if (currentTab === "zakat") main.innerHTML = renderZakat(); else if (currentTab === "balance-sheet") main.innerHTML = renderBalanceSheet(); else if (currentTab === "general-ledger") main.innerHTML = renderGeneralLedger(); else if (currentTab === "reconciliation") main.innerHTML = renderReconciliation(); else if (currentTab === "vendors") main.innerHTML = renderVendors(); else if (currentTab === "insurance") main.innerHTML = renderInsurance(); else if (currentTab === "inheritance") main.innerHTML = renderInheritance(); else if (currentTab === "reports") main.innerHTML = renderReports(); else if (currentTab === "activity-log") main.innerHTML = renderActivityLog(); else if (currentTab === "settings") main.innerHTML = renderSettings();
+  if (currentTab === "overview") main.innerHTML = renderOverview(); else if (currentTab === "clients") main.innerHTML = renderClients(); else if (currentTab === "invoices") main.innerHTML = renderInvoices(); else if (currentTab === "payments") main.innerHTML = renderPayments(); else if (currentTab === "expenses") main.innerHTML = renderExpenses(); else if (currentTab === "zakat") main.innerHTML = renderZakat(); else if (currentTab === "balance-sheet") main.innerHTML = renderBalanceSheet(); else if (currentTab === "general-ledger") main.innerHTML = renderGeneralLedger(); else if (currentTab === "reconciliation") main.innerHTML = renderReconciliation(); else if (currentTab === "vendors") main.innerHTML = renderVendors(); else if (currentTab === "insurance") main.innerHTML = renderInsurance(); else if (currentTab === "inheritance") main.innerHTML = renderInheritance(); else if (currentTab === "fixed-assets") main.innerHTML = renderFixedAssets(); else if (currentTab === "reports") main.innerHTML = renderReports(); else if (currentTab === "activity-log") main.innerHTML = renderActivityLog(); else if (currentTab === "settings") main.innerHTML = renderSettings();
   if (activityLogVerification && !activityLogVerification.ok) {
     main.insertAdjacentHTML("afterbegin", `\n      <div style="background:#B23B3B;color:#fff;padding:11px 18px;border-radius:6px;margin-bottom:18px;display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;font-size:12.5px;">\n        <span>⚠ Tamper detected — entry #${activityLogVerification.brokenIndex + 1} of ${activityLogVerification.count} in the Activity Log does not match its recorded hash. Something in the saved data was changed outside this app's own recording of it.</span>\n        <button class="btn-outline" style="border-color:#fff;color:#fff;white-space:nowrap;" onclick="switchTab('activity-log')">Review</button>\n      </div>`);
   }
@@ -3259,6 +3480,7 @@ function computeActionItems() {
   const inheritanceCases = computeInheritanceCases();
   const overdueInheritance = inheritanceCases.filter(k => k.deadlineAlertLevel === "overdue");
   const dueSoonInheritance = inheritanceCases.filter(k => k.deadlineAlertLevel === "due_soon");
+  const pendingDepreciation = computeFixedAssets().filter(a => !a.disposed && a.pendingAmount > .01);
   if (pendingInvoiceConsent.length) items.push({
     severity: "high",
     text: `${pendingInvoiceConsent.length} invoice(s) over USD 15,000 awaiting joint consent`,
@@ -3298,6 +3520,11 @@ function computeActionItems() {
     severity: "medium",
     text: `${dueSoonInheritance.length} inheritance case(s) with a payment deadline within ${INHERITANCE_DEADLINE_ALERT_DAYS} days`,
     tab: "inheritance"
+  });
+  if (pendingDepreciation.length) items.push({
+    severity: "medium",
+    text: `${pendingDepreciation.length} fixed asset(s) have depreciation accrued but not yet posted — run depreciation to bring them current`,
+    tab: "fixed-assets"
   });
   if (comingDue.length) items.push({
     severity: "medium",
@@ -3740,6 +3967,72 @@ function submitInheritanceCaseModal() {
   }, editId || null);
 }
 
+function renderFixedAssets() {
+  const assets = computeFixedAssets();
+  const pendingCount = assets.filter(a => !a.disposed && a.pendingAmount > .01).length;
+  const statusMeta = {
+    active: {
+      label: "Active",
+      color: "#2A6F3F"
+    },
+    fully_depreciated: {
+      label: "Fully Depreciated",
+      color: "#A9720A"
+    },
+    disposed: {
+      label: "Disposed",
+      color: "#6B7280"
+    }
+  };
+  const statusOf = a => a.disposed ? "disposed" : a.fullyDepreciated ? "fully_depreciated" : "active";
+  return `\n    <div class="view-header"><div><h2>Fixed Asset Register</h2><p>Cost, depreciation, and net book value — depreciation posts real journal entries, unlike Insurance/Inheritance</p></div>\n      <button class="btn btn-gold" onclick="openFixedAssetModal()">+ New Asset</button></div>\n    <div class="note-box">This is the one asset-tracking feature in this app that <strong>does</strong> post to the General Ledger — "Run Depreciation" below creates a real Expense record and journal entry per asset (debit Depreciation Expense, credit Accumulated Depreciation), the same mechanism as any other expense. The Balance Sheet's Manual Accounts section (for Fixed Assets or anything else) stays available alongside this for anything you'd rather track by hand — avoid entering the same physical assets in both places, since that would double-count them. Every add, edit, delete, disposal, and depreciation run is attributed and logged to the Activity Log, same as a manual Balance Sheet entry would be.</div>\n    <div class="card">\n      <h3>Run Depreciation</h3>\n      <p style="font-size:12.5px;color:#6B7280;margin:0 0 14px;">Posts whatever's accrued since each asset's last run, for every active asset, through the date below. Safe to run anytime — an asset already current through a later date is simply skipped, never double-posted.${pendingCount ? ` <strong>${pendingCount} asset(s) currently have depreciation pending.</strong>` : " Nothing is currently pending."}</p>\n      <div class="form-row">\n        <div class="form-group"><label>Through Date</label><input type="date" id="f-depreciation-as-of" value="${todayISO()}" /></div>\n      </div>\n      <button class="btn btn-navy" onclick="runDepreciation(document.getElementById('f-depreciation-as-of').value)">Run Depreciation</button>\n    </div>\n    <div class="card">\n      ${assets.length ? `<table>\n        <thead><tr><th>Asset</th><th>Category</th><th>Cost</th><th>Accum. Depreciation</th><th>NBV</th><th>Status</th><th></th></tr></thead>\n        <tbody>${assets.map(a => `\n          <tr>\n            <td style="font-weight:600;">${esc(a.name)}<div style="font-size:11px;color:#6B7280;font-weight:400;">${esc(a.number)}</div></td>\n            <td>${a.category ? esc(a.category) : "—"}</td>\n            <td class="right">${fmt(a.cost, a.currency)}</td>\n            <td class="right">${fmt(a.accumulatedDepreciation, a.currency)}</td>\n            <td class="right" style="font-weight:600;">${fmt(a.nbv, a.currency)}</td>\n            <td><span class="badge" style="background:${statusMeta[statusOf(a)].color}22;color:${statusMeta[statusOf(a)].color};">${statusMeta[statusOf(a)].label}</span></td>\n            <td style="white-space:nowrap;">\n              <button class="btn-outline" onclick="toggleFixedAssetHistory('${a.id}')">${expandedFixedAssetHistory === a.id ? "Hide" : "History"}</button>\n              <button class="btn-outline" onclick="openFixedAssetModal('${a.id}')">Edit</button>\n              ${a.disposed ? `<button class="btn-outline" onclick="undisposeFixedAsset('${a.id}')">Un-dispose</button>` : `<button class="btn-outline" onclick="openDisposeAssetModal('${a.id}')">Dispose</button>`}\n              <button class="btn-outline" onclick="deleteFixedAsset('${a.id}')">Delete</button>\n            </td>\n          </tr>\n          ${expandedFixedAssetHistory === a.id ? `\n          <tr><td colspan="7" style="background:#FAFAF8;padding:0;">\n            ${a.disposed ? `<p style="padding:10px 16px;font-size:12px;color:#6B7280;margin:0;">Disposed ${esc(a.disposalDate)}${a.disposalProceeds ? ` — proceeds ${fmt(a.disposalProceeds, a.currency)}` : ""} (recording only; no gain/loss posted to the ledger).</p>` : ""}\n            <p style="padding:10px 16px 0;font-size:12px;color:#6B7280;margin:0;">Straight-line over ${a.usefulLifeMonths} month(s), salvage value ${fmt(a.salvageValue, a.currency)} — ${fmt(a.monthlyDepreciation, a.currency)}/month while active.${!a.disposed && !a.fullyDepreciated ? ` ${a.pendingMonths} month(s) (${fmt(a.pendingAmount, a.currency)}) accrued since the last run, not yet posted.` : ""}</p>\n            ${state.expenses.filter(e => e.fixedAssetId === a.id).length ? `<table style="margin:8px 16px 12px;width:calc(100% - 32px);">\n              <thead><tr><th>Date</th><th>Amount</th><th>Journal Entry</th></tr></thead>\n              <tbody>${state.expenses.filter(e => e.fixedAssetId === a.id).sort((x, y) => x.date.localeCompare(y.date)).map(e => `<tr>\n                <td class="mono">${esc(e.date)}</td>\n                <td class="right">${fmt(e.amount, e.currency)}</td>\n                <td style="font-size:11px;color:#6B7280;">${esc(e.number)}</td>\n              </tr>`).join("")}</tbody>\n            </table>` : `<p class="empty" style="padding:4px 16px 14px;">No depreciation posted yet for this asset.</p>`}\n          </td></tr>` : ""}\n        `).join("")}</tbody>\n      </table>` : `<p class="empty">No fixed assets registered yet — add one, then use "Run Depreciation" above once it's due.</p>`}\n    </div>\n  `;
+}
+
+function toggleFixedAssetHistory(assetId) {
+  expandedFixedAssetHistory = expandedFixedAssetHistory === assetId ? null : assetId;
+  render();
+}
+
+function openFixedAssetModal(editId) {
+  const existing = editId ? state.fixedAssets.find(a => a.id === editId) : null;
+  const a = existing || {
+    name: "",
+    category: "",
+    acquisitionDate: todayISO(),
+    cost: "",
+    currency: "USD",
+    salvageValue: 0,
+    usefulLifeMonths: "",
+    notes: ""
+  };
+  document.getElementById("modalRoot").innerHTML = `\n    <div class="modal-overlay" onclick="if(event.target===this) closeModal()">\n      <div class="modal">\n        <div class="modal-header"><h3>${existing ? "Edit Asset" : "New Fixed Asset"}</h3><button class="modal-close" onclick="closeModal()">×</button></div>\n        <input type="hidden" id="f-edit-id" value="${editId || ""}" />\n        <div class="form-group"><label>Asset Name</label><input id="f-name" value="${esc(a.name)}" placeholder="e.g. Office Server, Toyota Land Cruiser" /></div>\n        <div class="form-group"><label>Category (optional)</label><input id="f-category" list="fixed-asset-category-datalist" value="${esc(a.category)}" placeholder="e.g. Equipment, Vehicles, Furniture" />\n          <datalist id="fixed-asset-category-datalist"><option value="Equipment"><option value="Furniture & Fixtures"><option value="Vehicles"><option value="Leasehold Improvements"><option value="Computer Hardware"></datalist>\n        </div>\n        <div class="form-row">\n          <div class="form-group"><label>Acquisition Date</label><input type="date" id="f-acquisition-date" value="${a.acquisitionDate}" /></div>\n          <div class="form-group"><label>Currency</label><select id="f-currency"><option value="USD" ${a.currency === "USD" ? "selected" : ""}>USD</option><option value="QAR" ${a.currency === "QAR" ? "selected" : ""}>QAR</option><option value="LBP" ${a.currency === "LBP" ? "selected" : ""}>LBP</option></select></div>\n        </div>\n        <div class="form-row">\n          <div class="form-group"><label>Cost</label><input type="number" min="0.01" step="0.01" id="f-cost" value="${a.cost}" /></div>\n          <div class="form-group"><label>Salvage Value (optional)</label><input type="number" min="0" step="0.01" id="f-salvage-value" value="${a.salvageValue}" /></div>\n        </div>\n        <div class="form-group"><label>Useful Life (months)</label><input type="number" min="1" step="1" id="f-useful-life" value="${a.usefulLifeMonths}" placeholder="e.g. 60 for 5 years" /></div>\n        <p style="font-size:11px;color:#6B7280;margin:-8px 0 12px;">Straight-line depreciation only, for now: (Cost − Salvage Value) ÷ Useful Life (months).</p>\n        <div class="form-group"><label>Notes (optional)</label><input id="f-notes" value="${esc(a.notes)}" /></div>\n        ${!existing ? `<p style="font-size:11px;color:#6B7280;margin:-8px 0 12px;">This records the asset for depreciation tracking only — it does not itself post the acquisition cost to the ledger (same as a Balance Sheet Manual Account). If you paid for it, record that payment as an Expense separately if it should hit the books.</p>` : ""}\n        <button class="btn btn-navy" style="width:100%;" onclick="submitFixedAssetModal()">${existing ? "Save Changes" : "Add Asset"}</button>\n      </div>\n    </div>`;
+}
+
+function submitFixedAssetModal() {
+  const editId = document.getElementById("f-edit-id").value;
+  addFixedAsset({
+    name: document.getElementById("f-name").value.trim(),
+    category: document.getElementById("f-category").value.trim(),
+    acquisitionDate: document.getElementById("f-acquisition-date").value,
+    currency: document.getElementById("f-currency").value,
+    cost: document.getElementById("f-cost").value,
+    salvageValue: document.getElementById("f-salvage-value").value,
+    usefulLifeMonths: document.getElementById("f-useful-life").value,
+    notes: document.getElementById("f-notes").value.trim()
+  }, editId || null);
+}
+
+function openDisposeAssetModal(assetId) {
+  const a = state.fixedAssets.find(a => a.id === assetId);
+  if (!a) return;
+  document.getElementById("modalRoot").innerHTML = `\n    <div class="modal-overlay" onclick="if(event.target===this) closeModal()">\n      <div class="modal">\n        <div class="modal-header"><h3>Dispose — ${esc(a.name)}</h3><button class="modal-close" onclick="closeModal()">×</button></div>\n        <input type="hidden" id="f-asset-id" value="${assetId}" />\n        <div class="form-group"><label>Disposal Date</label><input type="date" id="f-disposal-date" value="${todayISO()}" /></div>\n        <div class="form-group"><label>Proceeds Received (optional)</label><input type="number" min="0" step="0.01" id="f-disposal-proceeds" placeholder="Leave blank if none" /></div>\n        <p style="font-size:11px;color:#6B7280;margin:-8px 0 12px;">Stops further depreciation on this asset. Recording only — no disposal gain/loss is posted to the ledger; if proceeds were received, record that separately (e.g. as income) if it should hit the books.</p>\n        <button class="btn btn-navy" style="width:100%;" onclick="submitDisposeAssetModal()">Mark Disposed</button>\n      </div>\n    </div>`;
+}
+
+function submitDisposeAssetModal() {
+  const assetId = document.getElementById("f-asset-id").value;
+  disposeFixedAsset(assetId, document.getElementById("f-disposal-date").value, document.getElementById("f-disposal-proceeds").value);
+}
+
 function renderActivityLog() {
   const entries = [ ...state.activityLog ].reverse();
   const v = activityLogVerification;
@@ -3848,6 +4141,7 @@ function computeBalanceSheet() {
   const manualAssetsUSD = state.balanceSheetAccounts.filter(a => a.type === "asset").reduce((s, a) => s + usdEquivalent(a.balance, a.currency), 0);
   const manualLiabilitiesUSD = state.balanceSheetAccounts.filter(a => a.type === "liability").reduce((s, a) => s + usdEquivalent(a.balance, a.currency), 0);
   const manualEquityUSD = state.balanceSheetAccounts.filter(a => a.type === "equity").reduce((s, a) => s + usdEquivalent(a.balance, a.currency), 0);
+  const registeredAssetsNBVUSD = computeFixedAssets().filter(a => !a.disposed).reduce((s, a) => s + usdEquivalent(a.nbv, a.currency), 0);
   const ledgerCashUSD = ledgerAccountBalance("cash");
   const accountsReceivableUSD = ledgerAccountBalance("accounts_receivable");
   const ledgerOtherAssetsUSD = ledgerAccountBalance("other_assets");
@@ -3862,11 +4156,12 @@ function computeBalanceSheet() {
   const expenseUSD = ledgerAccountBalance("expense");
   const badDebtExpenseUSD = ledgerAccountBalance("bad_debt_expense");
   const retainedEarningsUSD = revenueUSD - expenseUSD - badDebtExpenseUSD;
-  const totalAssetsUSD = manualAssetsUSD + ledgerCashUSD + accountsReceivableUSD + ledgerOtherAssetsUSD + ledgerVatReceivableUSD;
+  const totalAssetsUSD = manualAssetsUSD + registeredAssetsNBVUSD + ledgerCashUSD + accountsReceivableUSD + ledgerOtherAssetsUSD + ledgerVatReceivableUSD;
   const totalLiabilitiesUSD = manualLiabilitiesUSD + ledgerDeferredRevenueUSD + ledgerVatPayableUSD + ledgerZakatPayableUSD + ledgerOtherLiabilitiesUSD;
   const totalEquityUSD = manualEquityUSD + ledgerOwnersCapitalUSD - zakatDistributionsUSD + retainedEarningsUSD;
   return {
     manualAssetsUSD: manualAssetsUSD,
+    registeredAssetsNBVUSD: registeredAssetsNBVUSD,
     manualLiabilitiesUSD: manualLiabilitiesUSD,
     manualEquityUSD: manualEquityUSD,
     accountsReceivableUSD: accountsReceivableUSD,
@@ -3897,7 +4192,7 @@ function renderBalanceSheet() {
     equity: "Equity"
   };
   const balanced = Math.abs(bs.differenceUSD) < .01;
-  return `\n    <div class="view-header"><div><h2>Balance Sheet</h2><p>Cash, Accounts Receivable, and Retained Earnings are posted automatically to a real double-entry ledger — Manual Accounts below are for anything the ledger can't know about on its own (fixed assets, a stated loan balance)</p></div>\n      <div style="display:flex;gap:8px;"><button class="btn btn-gold" onclick="openBalanceSheetAccountModal()">+ New Account</button><button class="btn btn-gold" onclick="openCashFlowTxnModal()">+ Investing/Financing Entry</button></div></div>\n    <div class="stat-grid">\n      <div class="stat-card"><div class="label">Total Assets</div><div class="value">${fmt(bs.totalAssetsUSD, "USD")}</div><div class="sub">${fmt(bs.ledgerCashUSD, "USD")} Cash + ${fmt(bs.accountsReceivableUSD, "USD")} AR</div></div>\n      <div class="stat-card"><div class="label">Total Liabilities</div><div class="value">${fmt(bs.totalLiabilitiesUSD, "USD")}</div><div class="sub">incl. ${fmt(bs.ledgerVatPayableUSD, "USD")} VAT Payable</div></div>\n      <div class="stat-card"><div class="label">Total Equity</div><div class="value">${fmt(bs.totalEquityUSD, "USD")}</div><div class="sub">incl. ${fmt(bs.retainedEarningsUSD, "USD")} Retained Earnings</div></div>\n      <div class="stat-card"><div class="label">Balance Check (A − L − E)</div><div class="value" style="color:${balanced ? "#2A6F3F" : "#B23B3B"};">${fmt(bs.differenceUSD, "USD")}</div><div class="sub">${balanced ? "Balanced" : "Out of balance — check your Manual Accounts below"}</div></div>\n    </div>\n    <div class="card">\n      <h3>Ledger-Derived (from the General Ledger — posted automatically)</h3>\n      <table>\n        <thead><tr><th>Account</th><th>Type</th><th>Balance</th></tr></thead>\n        <tbody>\n          <tr><td>Cash &amp; Bank</td><td>Asset</td><td class="right">${fmt(bs.ledgerCashUSD, "USD")}</td></tr>\n          <tr><td>Accounts Receivable</td><td>Asset</td><td class="right">${fmt(bs.accountsReceivableUSD, "USD")}</td></tr>\n          ${Math.abs(bs.ledgerOtherAssetsUSD) > .005 ? `<tr><td>Other Assets (Investing)</td><td>Asset</td><td class="right">${fmt(bs.ledgerOtherAssetsUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerVatReceivableUSD) > .005 ? `<tr><td>VAT Receivable (Input VAT)</td><td>Asset</td><td class="right">${fmt(bs.ledgerVatReceivableUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerDeferredRevenueUSD) > .005 ? `<tr><td>Revenue Awaiting Collection (legacy)</td><td>Liability</td><td class="right">${fmt(bs.ledgerDeferredRevenueUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerVatPayableUSD) > .005 ? `<tr><td>VAT Payable (Output VAT)</td><td>Liability</td><td class="right">${fmt(bs.ledgerVatPayableUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerZakatPayableUSD) > .005 ? `<tr><td>Zakat / Charitable Payable</td><td>Liability</td><td class="right">${fmt(bs.ledgerZakatPayableUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerOtherLiabilitiesUSD) > .005 ? `<tr><td>Other Liabilities (Financing)</td><td>Liability</td><td class="right">${fmt(bs.ledgerOtherLiabilitiesUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerOwnersCapitalUSD) > .005 ? `<tr><td>Owner's Capital</td><td>Equity</td><td class="right">${fmt(bs.ledgerOwnersCapitalUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.zakatDistributionsUSD) > .005 ? `<tr><td>Zakat Distributions</td><td>Equity (contra)</td><td class="right">-${fmt(bs.zakatDistributionsUSD, "USD")}</td></tr>` : ""}\n          <tr><td>Retained Earnings${Math.abs(bs.badDebtExpenseUSD) > .005 ? ` (net of ${fmt(bs.badDebtExpenseUSD, "USD")} Bad Debt Expense)` : ""}</td><td>Equity</td><td class="right">${fmt(bs.retainedEarningsUSD, "USD")}</td></tr>\n        </tbody>\n      </table>\n      <p style="font-size:11px;color:#6B7280;margin:10px 0 0;">See the General Ledger tab for the full journal entry trail behind these numbers.</p>\n    </div>\n    <div class="card">\n      <h3>Manual Accounts</h3>\n      ${accounts.length ? `<table>\n        <thead><tr><th>Name</th><th>Type</th><th>Balance</th><th></th></tr></thead>\n        <tbody>${accounts.map(a => `<tr><td style="font-weight:600;">${esc(a.name)}</td><td>${typeLabels[a.type]}</td><td class="right">${fmt(a.balance, a.currency)}</td><td style="white-space:nowrap;"><button class="btn-outline" onclick="openBalanceSheetAccountModal('${a.id}')">Edit</button><button class="btn-outline" onclick="deleteBalanceSheetAccount('${a.id}')">Delete</button></td></tr>`).join("")}</tbody>\n      </table>` : `<p class="empty">No manual accounts yet — add Fixed Assets, a stated Loan balance, or anything else the ledger has no way to know about on its own.</p>`}\n      <div class="note-box" style="margin-top:14px;">Cash, Accounts Receivable, Revenue Awaiting Collection, and Retained Earnings are computed automatically above and shouldn't be re-entered here — a manual "Cash & Bank" account would double-count against the ledger's own Cash figure.</div>\n    </div>\n    <div class="card">\n      <h3>Investing &amp; Financing Transactions</h3>\n      <p style="font-size:12.5px;color:#6B7280;margin:0 0 14px;">Feeds the Cash Flow Statement's Investing and Financing sections — asset purchases/sales, loan draws/repayments, owner contributions/distributions.</p>\n      ${state.cashFlowTransactions.length ? `<table>\n        <thead><tr><th>Ref #</th><th>Date</th><th>Category</th><th>Description</th><th>Amount</th><th></th></tr></thead>\n        <tbody>${[ ...state.cashFlowTransactions ].sort((a, b) => new Date(b.date) - new Date(a.date)).map(t => `<tr><td class="mono">${esc(t.number)}</td><td>${esc(t.date)}</td><td>${t.category === "investing" ? "Investing" : "Financing"}</td><td class="td-wrap">${esc(t.description)}</td><td class="right" style="color:${t.direction === "out" ? "#B23B3B" : "#2A6F3F"};">${t.direction === "out" ? "−" : "+"}${fmt(t.amount, t.currency)}</td><td style="white-space:nowrap;"><button class="btn-outline" onclick="openCashFlowTxnModal('${t.id}')">Edit</button><button class="btn-outline" onclick="deleteCashFlowTransaction('${t.id}')">Delete</button></td></tr>`).join("")}</tbody>\n      </table>` : '<p class="empty">No investing/financing transactions recorded yet.</p>'}\n    </div>\n  `;
+  return `\n    <div class="view-header"><div><h2>Balance Sheet</h2><p>Cash, Accounts Receivable, Retained Earnings, and the Fixed Asset Register's net book value are all posted automatically — Manual Accounts below are for anything none of those can know about on its own (a stated loan balance, or an asset you'd rather track by hand instead of in the register)</p></div>\n      <div style="display:flex;gap:8px;"><button class="btn btn-gold" onclick="openBalanceSheetAccountModal()">+ New Account</button><button class="btn btn-gold" onclick="openCashFlowTxnModal()">+ Investing/Financing Entry</button></div></div>\n    <div class="stat-grid">\n      <div class="stat-card"><div class="label">Total Assets</div><div class="value">${fmt(bs.totalAssetsUSD, "USD")}</div><div class="sub">${fmt(bs.ledgerCashUSD, "USD")} Cash + ${fmt(bs.accountsReceivableUSD, "USD")} AR</div></div>\n      <div class="stat-card"><div class="label">Total Liabilities</div><div class="value">${fmt(bs.totalLiabilitiesUSD, "USD")}</div><div class="sub">incl. ${fmt(bs.ledgerVatPayableUSD, "USD")} VAT Payable</div></div>\n      <div class="stat-card"><div class="label">Total Equity</div><div class="value">${fmt(bs.totalEquityUSD, "USD")}</div><div class="sub">incl. ${fmt(bs.retainedEarningsUSD, "USD")} Retained Earnings</div></div>\n      <div class="stat-card"><div class="label">Balance Check (A − L − E)</div><div class="value" style="color:${balanced ? "#2A6F3F" : "#B23B3B"};">${fmt(bs.differenceUSD, "USD")}</div><div class="sub">${balanced ? "Balanced" : "Out of balance — check your Manual Accounts below"}</div></div>\n    </div>\n    <div class="card">\n      <h3>Ledger-Derived (from the General Ledger — posted automatically)</h3>\n      <table>\n        <thead><tr><th>Account</th><th>Type</th><th>Balance</th></tr></thead>\n        <tbody>\n          <tr><td>Cash &amp; Bank</td><td>Asset</td><td class="right">${fmt(bs.ledgerCashUSD, "USD")}</td></tr>\n          <tr><td>Accounts Receivable</td><td>Asset</td><td class="right">${fmt(bs.accountsReceivableUSD, "USD")}</td></tr>\n          ${Math.abs(bs.registeredAssetsNBVUSD) > .005 ? `<tr><td>Fixed Asset Register (net book value)</td><td>Asset</td><td class="right">${fmt(bs.registeredAssetsNBVUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerOtherAssetsUSD) > .005 ? `<tr><td>Other Assets (Investing)</td><td>Asset</td><td class="right">${fmt(bs.ledgerOtherAssetsUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerVatReceivableUSD) > .005 ? `<tr><td>VAT Receivable (Input VAT)</td><td>Asset</td><td class="right">${fmt(bs.ledgerVatReceivableUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerDeferredRevenueUSD) > .005 ? `<tr><td>Revenue Awaiting Collection (legacy)</td><td>Liability</td><td class="right">${fmt(bs.ledgerDeferredRevenueUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerVatPayableUSD) > .005 ? `<tr><td>VAT Payable (Output VAT)</td><td>Liability</td><td class="right">${fmt(bs.ledgerVatPayableUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerZakatPayableUSD) > .005 ? `<tr><td>Zakat / Charitable Payable</td><td>Liability</td><td class="right">${fmt(bs.ledgerZakatPayableUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerOtherLiabilitiesUSD) > .005 ? `<tr><td>Other Liabilities (Financing)</td><td>Liability</td><td class="right">${fmt(bs.ledgerOtherLiabilitiesUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.ledgerOwnersCapitalUSD) > .005 ? `<tr><td>Owner's Capital</td><td>Equity</td><td class="right">${fmt(bs.ledgerOwnersCapitalUSD, "USD")}</td></tr>` : ""}\n          ${Math.abs(bs.zakatDistributionsUSD) > .005 ? `<tr><td>Zakat Distributions</td><td>Equity (contra)</td><td class="right">-${fmt(bs.zakatDistributionsUSD, "USD")}</td></tr>` : ""}\n          <tr><td>Retained Earnings${Math.abs(bs.badDebtExpenseUSD) > .005 ? ` (net of ${fmt(bs.badDebtExpenseUSD, "USD")} Bad Debt Expense)` : ""}</td><td>Equity</td><td class="right">${fmt(bs.retainedEarningsUSD, "USD")}</td></tr>\n        </tbody>\n      </table>\n      <p style="font-size:11px;color:#6B7280;margin:10px 0 0;">See the General Ledger tab for the full journal entry trail behind these numbers.</p>\n    </div>\n    <div class="card">\n      <h3>Manual Accounts</h3>\n      ${accounts.length ? `<table>\n        <thead><tr><th>Name</th><th>Type</th><th>Balance</th><th></th></tr></thead>\n        <tbody>${accounts.map(a => `<tr><td style="font-weight:600;">${esc(a.name)}</td><td>${typeLabels[a.type]}</td><td class="right">${fmt(a.balance, a.currency)}</td><td style="white-space:nowrap;"><button class="btn-outline" onclick="openBalanceSheetAccountModal('${a.id}')">Edit</button><button class="btn-outline" onclick="deleteBalanceSheetAccount('${a.id}')">Delete</button></td></tr>`).join("")}</tbody>\n      </table>` : `<p class="empty">No manual accounts yet — add a stated Loan balance, an asset you're tracking here instead of the Fixed Asset Register, or anything else the ledger has no way to know about on its own.</p>`}\n      <div class="note-box" style="margin-top:14px;">Cash, Accounts Receivable, Revenue Awaiting Collection, Retained Earnings, and anything in the Fixed Asset Register are all computed automatically above and shouldn't be re-entered here — e.g. an asset already in the register plus a manual account for the same thing would double-count it. Every add/edit/delete here is attributed to whoever did it (Acting As) and recorded in the Activity Log, exactly like every other transaction in this app — that log is where "who touched what manually" is actually monitored from, not a separate system.</div>\n    </div>\n    <div class="card">\n      <h3>Investing &amp; Financing Transactions</h3>\n      <p style="font-size:12.5px;color:#6B7280;margin:0 0 14px;">Feeds the Cash Flow Statement's Investing and Financing sections — asset purchases/sales, loan draws/repayments, owner contributions/distributions.</p>\n      ${state.cashFlowTransactions.length ? `<table>\n        <thead><tr><th>Ref #</th><th>Date</th><th>Category</th><th>Description</th><th>Amount</th><th></th></tr></thead>\n        <tbody>${[ ...state.cashFlowTransactions ].sort((a, b) => new Date(b.date) - new Date(a.date)).map(t => `<tr><td class="mono">${esc(t.number)}</td><td>${esc(t.date)}</td><td>${t.category === "investing" ? "Investing" : "Financing"}</td><td class="td-wrap">${esc(t.description)}</td><td class="right" style="color:${t.direction === "out" ? "#B23B3B" : "#2A6F3F"};">${t.direction === "out" ? "−" : "+"}${fmt(t.amount, t.currency)}</td><td style="white-space:nowrap;"><button class="btn-outline" onclick="openCashFlowTxnModal('${t.id}')">Edit</button><button class="btn-outline" onclick="deleteCashFlowTransaction('${t.id}')">Delete</button></td></tr>`).join("")}</tbody>\n      </table>` : '<p class="empty">No investing/financing transactions recorded yet.</p>'}\n    </div>\n  `;
 }
 
 function computeTrialBalance() {
@@ -4745,7 +5040,7 @@ function exportExpenseReportCSV() {
 function printBalanceSheetReport() {
   const bs = computeBalanceSheet();
   const line = (label, amount, bold) => `<tr><td style="padding:${bold ? "8px" : "6px"} 10px;${bold ? "font-weight:700;" : ""}border-bottom:1px solid #EEE;">${esc(label)}</td><td style="padding:${bold ? "8px" : "6px"} 10px;text-align:right;${bold ? "font-weight:700;" : ""}border-bottom:1px solid #EEE;">${fmt(amount, "USD")}</td></tr>`;
-  const assetRows = line("Cash & Bank", bs.ledgerCashUSD) + line("Accounts Receivable", bs.accountsReceivableUSD) + (Math.abs(bs.ledgerOtherAssetsUSD) > .005 ? line("Other Assets (Investing)", bs.ledgerOtherAssetsUSD) : "") + state.balanceSheetAccounts.filter(a => a.type === "asset").map(a => line(a.name, usdEquivalent(a.balance, a.currency))).join("");
+  const assetRows = line("Cash & Bank", bs.ledgerCashUSD) + line("Accounts Receivable", bs.accountsReceivableUSD) + (Math.abs(bs.registeredAssetsNBVUSD) > .005 ? line("Fixed Asset Register (net book value)", bs.registeredAssetsNBVUSD) : "") + (Math.abs(bs.ledgerOtherAssetsUSD) > .005 ? line("Other Assets (Investing)", bs.ledgerOtherAssetsUSD) : "") + state.balanceSheetAccounts.filter(a => a.type === "asset").map(a => line(a.name, usdEquivalent(a.balance, a.currency))).join("");
   const liabRows = line("Revenue Awaiting Collection", bs.ledgerDeferredRevenueUSD) + (Math.abs(bs.ledgerZakatPayableUSD) > .005 ? line("Zakat / Charitable Payable", bs.ledgerZakatPayableUSD) : "") + (Math.abs(bs.ledgerOtherLiabilitiesUSD) > .005 ? line("Other Liabilities (Financing)", bs.ledgerOtherLiabilitiesUSD) : "") + state.balanceSheetAccounts.filter(a => a.type === "liability").map(a => line(a.name, usdEquivalent(a.balance, a.currency))).join("");
   const equityRows = (Math.abs(bs.ledgerOwnersCapitalUSD) > .005 ? line("Owner's Capital", bs.ledgerOwnersCapitalUSD) : "") + (Math.abs(bs.zakatDistributionsUSD) > .005 ? line("Zakat Distributions", -bs.zakatDistributionsUSD) : "") + line("Retained Earnings", bs.retainedEarningsUSD) + state.balanceSheetAccounts.filter(a => a.type === "equity").map(a => line(a.name, usdEquivalent(a.balance, a.currency))).join("");
   openPrintReport(`\n    ${reportLetterhead("BALANCE SHEET", "As of " + todayISO())}\n    <div style="font-size:11px;font-weight:700;color:${NAVY};margin-bottom:6px;">ASSETS</div>\n    <table style="width:100%;border-collapse:collapse;">${assetRows}${line("Total Assets", bs.totalAssetsUSD, true)}</table>\n    <div style="font-size:11px;font-weight:700;color:${NAVY};margin:18px 0 6px;">LIABILITIES</div>\n    <table style="width:100%;border-collapse:collapse;">${liabRows}${line("Total Liabilities", bs.totalLiabilitiesUSD, true)}</table>\n    <div style="font-size:11px;font-weight:700;color:${NAVY};margin:18px 0 6px;">EQUITY</div>\n    <table style="width:100%;border-collapse:collapse;margin-bottom:18px;">${equityRows}${line("Total Equity", bs.totalEquityUSD, true)}</table>\n    <div style="display:flex;justify-content:space-between;padding:12px 10px;background:#F7F5F1;border-radius:6px;font-size:14px;font-weight:700;">\n      <span>Total Liabilities + Equity</span><span>${fmt(bs.totalLiabilitiesUSD + bs.totalEquityUSD, "USD")}</span>\n    </div>\n    ${Math.abs(bs.differenceUSD) >= .01 ? `<div class="note-box" style="margin-top:14px;">Out of balance by ${fmt(Math.abs(bs.differenceUSD), "USD")} — the ledger-derived lines above always balance by construction, so this points to a Manual Account (see the Balance Sheet tab) that has no offsetting entry.</div>` : ""}\n  `);
@@ -4763,6 +5058,11 @@ function exportBalanceSheetCSV() {
     section: "Asset",
     name: "Accounts Receivable",
     amountUSD: bs.accountsReceivableUSD
+  });
+  if (Math.abs(bs.registeredAssetsNBVUSD) > .005) rows.push({
+    section: "Asset",
+    name: "Fixed Asset Register (net book value)",
+    amountUSD: bs.registeredAssetsNBVUSD
   });
   if (Math.abs(bs.ledgerOtherAssetsUSD) > .005) rows.push({
     section: "Asset",
@@ -5762,7 +6062,8 @@ function clearSensitiveStateFromMemory() {
     integrityCheckpoints: [ ...SEED_INTEGRITY_CHECKPOINTS ],
     insurancePolicies: [ ...SEED_INSURANCE_POLICIES ],
     insurancePremiums: [ ...SEED_INSURANCE_PREMIUMS ],
-    inheritanceCases: [ ...SEED_INHERITANCE_CASES ]
+    inheritanceCases: [ ...SEED_INHERITANCE_CASES ],
+    fixedAssets: [ ...SEED_FIXED_ASSETS ]
   };
 }
 
